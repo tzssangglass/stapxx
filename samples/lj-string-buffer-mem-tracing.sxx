@@ -1,0 +1,102 @@
+#!/usr/bin/env stap++
+
+@use luajit_gc64
+
+global total_allocated
+global total_freed
+global pending_buf_grow
+global active_user_buffers
+
+probe begin {
+    printf("Start tracing buffer memory for %d (%s)\n", target(), execname())
+    if ("$^arg_time" != "") {
+        printf("Will run for %s seconds...\n", "$^arg_time")
+    } else {
+        printf("Hit Ctrl-C to end.\n")
+    }
+    total_allocated = 0
+    total_freed = 0
+}
+
+probe process("$^libluajit_path").function("buf_grow") {
+    sb = $sb
+    try {
+        $*sb := @cast(sb, "SBuf", "$^libluajit_path")
+        mref = $*sb->L->ptr64
+        flags = mref & 7
+
+        if (flags & 1) {
+            b = $*sb->b
+            e = $*sb->e
+            old_size = e - b
+            pending_buf_grow[sb] = old_size
+        }
+    } catch {
+        printf("[%d] buf_grow.call (struct access failed)\n", gettimeofday_us())
+    }
+}
+
+probe process("$^libluajit_path").function("buf_grow").return {
+    sb = @entry($sb)
+    try {
+        $*sb := @cast(sb, "SBuf", "$^libluajit_path")
+        mref = $*sb->L->ptr64
+        flags = mref & 7
+
+        if (flags & 1) {
+            b = $*sb->b
+            e = $*sb->e
+            new_size = e - b
+            old_size = pending_buf_grow[sb]
+            if (new_size > old_size) {
+                total_allocated += (new_size - old_size)
+                active_user_buffers[sb] = new_size
+            }
+        }
+        delete pending_buf_grow[sb]
+    } catch {
+        printf("[%d] buf_grow.return (struct access failed)\n", gettimeofday_us())
+        if (sb in pending_buf_grow) {
+            delete pending_buf_grow[sb]
+        }
+    }
+}
+
+probe process("$^libluajit_path").function("lj_bufx_free") {
+    sbx = $sbx
+    try {
+        $*sbx := @cast(sbx, "SBufExt", "$^libluajit_path")
+        mref = $*sbx->L->ptr64
+        flags = mref & 7
+
+        if ((flags & 1) && (sbx in active_user_buffers)) {
+            b = $*sbx->b
+            e = $*sbx->e
+            freed_size = e - b
+            total_freed += freed_size
+            delete active_user_buffers[sbx]
+        }
+    } catch {
+        printf("[%d] lj_bufx_free.call (struct access failed)\n", gettimeofday_us())
+    }
+}
+
+%( "$^arg_time" != "" %?
+probe timer.s($^arg_time) {
+    printf("Time's up. Quitting now...\n")
+    exit()
+}
+%)
+
+probe timer.s(30) {
+    printf("[periodic] Unfreed user buffer memory: %d bytes (allocated: %d, freed: %d)\n",
+        total_allocated - total_freed, total_allocated, total_freed)
+}
+
+probe end {
+    printf("\n=== FINAL SYSTEMTAP BUFFER MEMORY REPORT ===\n")
+    printf("Total allocated by user buffers: %d bytes\n", total_allocated)
+    printf("Total freed from user buffers: %d bytes\n", total_freed)
+    printf("Unfreed memory for user buffers: %d bytes\n", total_allocated - total_freed)
+    delete pending_buf_grow
+}
